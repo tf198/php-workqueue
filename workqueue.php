@@ -3,13 +3,72 @@
  * A simple (one file) task queue for background processing.  Can be
  * used for parallel processing or as a daemonised service.
  *
+ * Launches workers in subprocesses using a bootstrap specified by the job and then
+ * runs task methods on the workers.
+ *
  * @licence GPLv3
  * @author Tris Forster
  */
-class WorkQueue {
 
-	const MAX_ATTEMPTS = 3;
-	const RETRY_DELAY = 5;
+$job_stopped = serialize(new WorkQueueException("Job stopped"));
+
+class WorkQueueDatabase extends PDO {
+
+	function __construct($path) {
+		parent::__construct('sqlite:' . $path);
+
+		$key = ftok($path, 'a');
+		$this->sem = sem_get($key);
+	}
+
+	/**
+	 * Helper method - fetch a single row from the database using a prepared statement.
+	 *
+	 * @param string $sql
+	 * @param array $params
+	 * @throws OutOfBoundsException if no items returned
+	 * @return array
+	 */
+	public function fetchOne($sql, $params=array()) {
+		$query = $this->prepare($sql);
+		$query->execute($params);
+		$result = $query->fetch();
+		$query->closeCursor();
+		if(!$result) throw new OutOfBoundsException("No item returned");
+		return $result;
+	}
+
+	/**
+	 * Helper method - execute a single query using a prepared statement.
+	 *
+	 * @param string $sql
+	 * @param array $params
+	 */
+	public function execOne($sql, $params=array()) {
+		$query = $this->prepare($sql);
+		$query->execute($params);
+	}
+
+	function beginTransaction() {
+		$this->lock = sem_acquire($this->sem);
+		return parent::beginTransaction();
+	}
+
+	function commit() {
+		$success = parent::commit();
+		$this->lock = !sem_release($this->sem);
+		return $success;
+	}
+
+	function rollBack() {
+		$success = parent::rollBack();
+		$this->lock = !sem_release($this->sem);
+		return $success;
+	}
+
+}
+
+class WorkQueue {
 
 	const STATUS_QUEUED = 0;
 	const STATUS_RUNNING = 1;
@@ -18,10 +77,24 @@ class WorkQueue {
 
 	private $db;
 
+	public static $instance = null;
+	public static $job = null;
+
 	private static $instances = array();
+
+	public $retry_delay = 5; # seconds to wait between catchable exceptions
+
+	public $max_retry = 3; # how many attempts should a task get
+
+	public $poll_interval = 1; # seconds between manager polls
+
+	public $spawn_limit = 3;
+
+	public $debug = false;
 
 	private function __construct($file) {
 
+		$this->file = $file;
 		$this->pid = getmypid();
 		$this->start_time = microtime(true);
 
@@ -33,18 +106,32 @@ class WorkQueue {
 			$created = true;
 		}
 
-		$this->db = new PDO('sqlite:' . $this->path);
+		$this->log("Database: {$this->path}");
+
+		$this->db = new WorkQueueDatabase($this->path);
 		$this->db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
 		$this->db->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
 
-		if($created) {
-			$this->db->exec("CREATE TABLE jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, bootstrap VARCHAR, pid INTEGER, workers INTEGER, started INTEGER)");
-			$this->db->exec("CREATE TABLE tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, job_id INTEGER, pid INTEGER, method VARCHAR, params TEXT, priority INTEGER, status INTEGER, retry INTEGER, result TEXT)");
-			$this->db->exec("CREATE TABLE workers (id INTEGER PRIMARY KEY AUTOINCREMENT, job_id INTEGER, pid INTEGER)");
-		}
-
 		$this->log_dir = $this->path . ".logs";
-		if(!is_dir($this->log_dir)) mkdir($this->log_dir);
+
+		$this->db->exec("PRAGMA busy_timeout=10000");
+
+		if($created) {
+			$cmds = array(
+					#"PRAGMA journal_mode=WAL",
+					"CREATE TABLE jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, bootstrap VARCHAR, pid INTEGER, workers INTEGER, started INTEGER);",
+					"CREATE TABLE tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, job_id INTEGER, pid INTEGER, method VARCHAR, params_data TEXT, priority INTEGER, status INTEGER, retry INTEGER, result_data TEXT);",
+					"CREATE TABLE workers (id INTEGER PRIMARY KEY AUTOINCREMENT, job_id INTEGER, pid INTEGER);"
+			);
+			foreach($cmds as $cmd) $this->db->exec($cmd);
+
+			// create or clear the log dir
+			if(is_dir($this->log_dir)) {
+				exec("rm -f {$this->log_dir}/*");
+			} else {
+				mkdir($this->log_dir);
+			}
+		}
 	}
 
 	/**
@@ -61,6 +148,14 @@ class WorkQueue {
 	}
 
 	/**
+	 * Remove the WorkQueue instance from the static instances.
+	 */
+	public static function release($file) {
+		self::$instances[$file]->db = null;
+		unset(self::$instances[$file]);
+	}
+
+	/**
 	 * Create a new job.  Does not start the job.
 	 *
 	 * @param string $bootstrap the bootstrap file to use for workers
@@ -69,8 +164,7 @@ class WorkQueue {
 	 */
 	public function add_job($bootstrap, $workers=3) {
 		$this->db->beginTransaction();
-		$query = $this->db->prepare("INSERT INTO jobs (bootstrap, 'workers') VALUES (?, ?)");
-		$query->execute(array($bootstrap, $workers));
+		$this->db->execOne("INSERT INTO jobs (bootstrap, 'workers') VALUES (?, ?)", array($bootstrap, $workers));
 		$jid = $this->db->lastInsertId();
 		$this->db->commit();
 
@@ -81,18 +175,148 @@ class WorkQueue {
 	/**
 	 * Add a task to a job.
 	 *
-	 * @param number $job job id
+	 * @param number $jid job id
 	 * @param string $method callable method
 	 * @param array $params params to pass to the method
-	 * @param number $priority task priority - higher executes later
+	 * @param number $priority priority group - higher executes later
 	 */
-	public function add_task($job, $method, $params=array(), $priority=0, $retry=3) {
+	public function add_task($jid, $method, $params=array(), $priority=0, $retry=3) {
+		// check the job exists
+		$job = $this->get_job($jid);
+
 		$this->db->beginTransaction();
-		$query = $this->db->prepare("INSERT INTO tasks (job_id, method, params, priority, retry, status) VALUES (?, ?, ?, ?, ?, 0)");
-		$query->execute(array($job, $method, serialize($params), $priority, $retry));
+		$this->db->execOne(
+				"INSERT INTO tasks (job_id, method, params_data, priority, retry, status) VALUES (?, ?, ?, ?, ?, 0)",
+				array($jid, $method, serialize($params), $priority, $retry)
+		);
+		$task_id = $this->db->lastInsertId();
 		$this->db->commit();
 
-		$this->log("Added task: {$method}()");
+		$this->log("Added task {$task_id}: {$method}()");
+		return $task_id;
+	}
+
+	/**
+	 * Retrieve job info
+	 *
+	 * @param number $jid
+	 * @return array
+	 */
+	public function get_job($jid) {
+		try {
+			return $this->db->fetchOne("SELECT * FROM jobs WHERE id=?", array($jid));
+		} catch(OutOfBoundsException $nfe) {
+			throw new WorkQueueException("No such job: {$jid}");
+		}
+	}
+
+	/**
+	 * Get job tasks, optionally limited to one priority level.
+	 * Will block until all tasks have completed.
+	 *
+	 * @param number $jid
+	 * @param number $priority
+	 * @param number $timeout;
+	 */
+	public function get_tasks($jid, $priority=false, $timeout=300) {
+		$criteria = "job_id=?";
+		$params = array($jid);
+		if($priority !== false) {
+			$criteria .= " AND priority=?";
+			$params[] = $priority;
+		}
+
+		return $this->task_query($criteria, $params);
+	}
+
+	public function get_task_set($task_ids, $timeout=300) {
+
+	}
+
+	public function task_query($criteria, $params, $timeout=300) {
+		$check = "SELECT COUNT(id) c FROM tasks WHERE {$criteria} AND status<2";
+
+		# wait for all tasks to complete (up to timeout)
+		while($timeout > 0) {
+			$result = $this->db->fetchOne($check, $params);
+			if($result['c'] == 0) break;
+			$this->log("Waiting for {$result['c']} tasks to complete");
+			usleep($this->poll_interval * 1000000);
+			$timeout--;
+		}
+		if($timeout==0) throw new WorkQueueTimeoutException("Tasks failed to complete in time");
+
+		$query = $this->db->prepare("SELECT * FROM tasks WHERE {$criteria} ORDER BY id");
+		$query->execute($params);
+
+		$result = $query->fetchAll();
+		for($i=0, $c=count($result); $i<$c; $i++) {
+			$result[$i]['result'] = unserialize($result[$i]['result_data']);
+		}
+		return $result;
+	}
+
+	/**
+	 * Get a list of results for a a job, optionally limited to one priority level.
+	 * Will block until all results are ready.
+	 *
+	 * @param number $jid job id
+	 * @param number $priority limit to a specific priority queue
+	 * @param number $timeout seconds to block before raising WorkQueueTimeoutException
+	 * @throws WorkQueueTimeoutException
+	 * @throws Exception if any of the tasks failed
+	 */
+	public function get_results($jid, $priority=false, $timeout=300, $throw=true) {
+		$tasks = $this->get_tasks($jid, $priority, $timeout);
+		$result = array();
+		foreach($tasks as $task) {
+			if($throw && $task['status']==self::STATUS_FAILED) throw $task['result'];
+			$result[] = $task['result'];
+		}
+		return $result;
+	}
+
+	/**
+	 * Get a single completed task.
+	 * Will block until task is completed.
+	 *
+	 * @param number $task_id
+	 * @param number $timeout
+	 * @throws OutOfBoundsException
+	 * @throws WorkQueueTimeoutException
+	 * @return string
+	 */
+	public function get_task($task_id, $timeout=300) {
+		$query = $this->db->prepare("SELECT * FROM tasks WHERE id=?");
+		for($i=0; $i<$timeout; $i++) {
+			$query->execute(array($task_id));
+			$task = $query->fetch();
+			$query->closeCursor();
+
+			if(!$task) throw new OutOfBoundsException("No such task: {$task_id}");
+			if($task['status'] > self::STATUS_RUNNING) {
+				$task['result'] = unserialize($task['result_data']);
+				return $task;
+			}
+			usleep($this->poll_interval * 1000000);
+		}
+		throw new WorkQueueTimeoutException("Task failed to complete in time");
+	}
+
+	/**
+	 * Get the result for a single completed task.
+	 * Will block until task is completed.
+	 *
+	 * @param unknown $task_id
+	 * @param number $timeout
+	 * @param string $throw
+	 * @throws string
+	 * @return Ambiguous
+	 */
+	public function get_result($task_id, $timeout=300, $throw=true) {
+		$task = $this->get_task($task_id, $timeout);
+		if($throw && $task['status']==self::STATUS_FAILED) throw $task['result'];
+		return $task['result'];
 	}
 
 	/**
@@ -108,12 +332,7 @@ class WorkQueue {
 				'stats' => array('tasks' => 0, 'workers' => 0)
 		);
 
-		$query = $this->db->prepare("SELECT * FROM jobs WHERE id=?");
-		$query->execute(array($job));
-		$result['job'] = $query->fetch();
-		$query->closeCursor();
-
-		if(!$result['job']) throw new Exception("No such job: {$job}");
+		$result['job'] = $this->get_job($job);
 
 		$result['job']['running'] = ($result['job']['pid'] && $this->is_running($result['job']['pid']));
 
@@ -152,17 +371,13 @@ class WorkQueue {
 
 	/**
 	 * Bootstraps the current process ready for processing tasks.
-	 * @param number $job job id
+	 * @param number $jid job id
 	 * @throws Exception
 	 */
-	public function bootstrap($job) {
-		$query = $this->db->prepare("SELECT bootstrap FROM jobs WHERE id=?");
-		$query->execute(array($job));
-		$file = $query->fetchColumn(0);
-		$query->closeCursor();
-		if(!$file) throw new Exception("Failed to retrieve job");
-		$this->log("Bootstrapping with {$file}");
-		require_once $file;
+	public function bootstrap($jid) {
+		$job = $this->get_job($jid);
+		$this->log("Bootstrapping with {$job['bootstrap']}");
+		require_once $job['bootstrap'];
 	}
 
 	/**
@@ -173,7 +388,9 @@ class WorkQueue {
 	 * @return number process id spawned
 	 */
 	private function spawn($cmd, $output="/dev/null") {
-		$pid = (int) rtrim(shell_exec(sprintf("%s > \"%s\" 2>&1 & echo $!", $cmd, $output)));
+		$shell = sprintf("%s > \"%s\" 2>&1 & echo $!", $cmd, $output);
+		#$this->log("Full command: {$shell}");
+		$pid = (int) rtrim(shell_exec($shell));
 		if(!$pid) throw new Exception("Failed to spawn process");
 		return $pid;
 	}
@@ -199,6 +416,12 @@ class WorkQueue {
 		return false;
 	}
 
+	private function kill($pid) {
+		$result = shell_exec(sprintf('kill %d', $pid));
+		var_dump($result);
+		return true;
+	}
+
 	/**
 	 * Run a job by spawning and monitoring workers.
 	 *
@@ -208,15 +431,7 @@ class WorkQueue {
 	public function run_job($jid, $daemon=false) {
 		$this->db->beginTransaction();
 
-		$query = $this->db->prepare("SELECT * FROM jobs WHERE id=?");
-		$query->execute(array($jid));
-		$job= $query->fetch();
-		$query->closeCursor();
-
-		if(!$job) {
-			$this->log("No such job: ${jid}");
-			exit(1);
-		}
+		$job = $this->get_job($jid);
 
 		// check there isn't another manager running
 		if($job['pid']) {
@@ -227,24 +442,22 @@ class WorkQueue {
 		}
 
 		// claim the job
-		$query = $this->db->prepare("UPDATE jobs SET pid=? WHERE id=?");
-		$query->execute(array($this->pid, $jid));
+		$this->db->execOne("UPDATE jobs SET pid=? WHERE id=?", array($this->pid, $jid));
 
 		// clear previous half run jobs
-		$query = $this->db->prepare("UPDATE tasks SET pid=NULL, status=0 WHERE job_id=? AND status=1");
-		$query->execute(array($jid));
+		$this->db->execOne("UPDATE tasks SET pid=NULL, status=0 WHERE job_id=? AND status=1", array($jid));
 
 		$this->db->commit();
 
 		$this->log("Starting job {$jid} ({$job['workers']} workers)");
 
-		// todo: add pid to job table and bail if already managed
 
+		// prepare statements for efficiency
 		$delete_worker = $this->db->prepare("DELETE FROM workers WHERE id=?");
 		$insert_worker = $this->db->prepare("INSERT INTO workers (job_id, pid) VALUES (?, ?)");
 		$clear_tasks = $this->db->prepare("UPDATE tasks SET pid=NULL, status=0 WHERE job_id=? AND pid=? AND status=1");
 
-		$spawn_limit = $job['workers'] * 3;
+		$spawn_limit = $job['workers'] + $this->spawn_limit;
 
 		$running = true;
 		$spawned = 0;
@@ -254,10 +467,8 @@ class WorkQueue {
 			$this->db->beginTransaction();
 
 			// get a count of remaining tasks
-			$query = $this->db->prepare("SELECT COUNT(id) FROM tasks WHERE job_id=? AND status<2");
-			$query->execute(array($jid));
-			$remaining = $query->fetchColumn(0);
-			$query->closeCursor();
+			$result = $this->db->fetchOne("SELECT COUNT(id) c FROM tasks WHERE job_id=? AND status<2", array($jid));
+			$remaining = $result['c'];
 			$this->log("{$remaining} tasks remaining");
 
 			// clear out old worker entries
@@ -290,7 +501,9 @@ class WorkQueue {
 
 				if($spawned >= $spawn_limit) {
 					$this->log("Limit of {$spawn_limit} processes reached - bailing!");
-					break 2;
+					$this->db->commit();
+					$this->stop_job($jid);
+					throw new WorkQueueException("Spawn limit of {$this->spawn_limit} reached");
 				}
 				$spawned++;
 				$pid = $this->spawn_workqueue($jid, 'worker', "{$this->log_dir}/job-{$jid}_{$spawned}.log");
@@ -302,14 +515,20 @@ class WorkQueue {
 			$this->db->commit();
 
 			// sleep till next check
-			sleep(5);
+			usleep($this->poll_interval * 1000000);
 		}
 
 		// release the job
 		$this->db->beginTransaction();
-		$query = $this->db->prepare("UPDATE jobs SET pid=NULL WHERE id=?");
-		$query->execute(array($jid));
+		$this->db->execOne("UPDATE jobs SET pid=NULL WHERE id=?", array($jid));
 		$this->db->commit();
+		$this->log("Finished job {$jid}");
+
+		// check the result
+		$result = $this->db->fetchOne("SELECT COUNT(id) c FROM tasks WHERE job_id=? AND status<>?", array($jid, self::STATUS_SUCCESS));
+		if($result['c'] > 0) throw new WorkQueueException("{$result['c']} tasks failed");
+
+		return true;
 	}
 
 	/**
@@ -325,9 +544,11 @@ class WorkQueue {
 	 */
 	public function run_task($jid) {
 		$this->log("Fetching work for job ${jid}");
-		$query = $this->db->prepare("UPDATE tasks set pid=?, status=1 WHERE job_id=? AND status=0 ORDER BY priority, id LIMIT 1");
 		$this->db->beginTransaction();
-		$result = $query->execute(array($this->pid, $jid));
+		$this->db->execOne(
+				"UPDATE tasks set pid=?, status=1 WHERE job_id=? AND status=0 ORDER BY priority, id LIMIT 1",
+				array($this->pid, $jid)
+		);
 		$this->db->commit();
 
 		$query = $this->db->prepare("SELECT * FROM tasks WHERE job_id=? AND pid=? AND status=?");
@@ -349,7 +570,9 @@ class WorkQueue {
 
 		for($i=$task['retry']; $i>0; $i--) {
 			try {
-				$result = call_user_func_array($task['method'], unserialize($task['params']));
+				$this->log("Executing {$task['method']}");
+				$result = call_user_func_array($task['method'], unserialize($task['params_data']));
+				$this->log("Result: {$result}");
 				$status = self::STATUS_SUCCESS;
 				$this->log("Finished task {$task['id']}");
 				break;
@@ -359,17 +582,16 @@ class WorkQueue {
 				$this->log("Exception while executing {$task['id']}");
 				$this->log($e->getTraceAsString());
 				if($i > 1) {
-					$this->log("Trying again in " . self::RETRY_DELAY . " seconds...");
-					sleep(self::RETRY_DELAY);
+					$this->log("Trying again in {$this->retry_delay} seconds...");
+					usleep($this->retry_delay * 1000000);
 				} else {
 					$this->log("Retry limit reached - returning failure");
 				}
 			}
 		}
 		// release the task
-		$query = $this->db->prepare("UPDATE tasks SET status=?, result=? WHERE id=?");
 		$this->db->beginTransaction();
-		$query->execute(array($status, serialize($result), $task['id']));
+		$this->db->execOne("UPDATE tasks SET status=?, result_data=? WHERE id=?", array($status, serialize($result), $task['id']));
 		$this->db->commit();
 		$this->log("Released task {$task['id']}");
 	}
@@ -380,9 +602,38 @@ class WorkQueue {
 	 * @param number $job job id
 	 */
 	public function run_background($job) {
-		$pid = $this->spawn_workqueue($job, 'process', "{$this->log_dir}/job-{$job}.log");
+		$pid = $this->spawn_workqueue($job, 'process', "{$this->log_dir}/job-{$job}_0.log");
 		$this->log("Spawned background processor with pid ${pid}");
 		return $pid;
+	}
+
+	public function stop_job($jid) {
+		$this->log("Stopping job {$jid}");
+		$job = $this->get_job($jid);
+
+		$this->db->beginTransaction();
+
+		// kill all the workers
+		$query = $this->db->prepare("SELECT * FROM workers WHERE job_id=?");
+		$query->execute(array($jid));
+		$this->log("Terminating workers");
+		while($row = $query->fetch()) {
+			if($this->is_running($row['pid'])) {
+				$this->log("Shutting down worker {$row['pid']}");
+				$this->kill($row['pid']);
+			}
+		}
+		$this->db->execOne("DELETE FROM workers WHERE job_id=?", array($jid));
+
+		global $job_stopped;
+		$this->db->execOne(
+				"UPDATE tasks SET status=?, result_data=? WHERE job_id=? AND status<2",
+				array(self::STATUS_FAILED, $job_stopped, $jid)
+		);
+
+		$this->db->execOne("UPDATE jobs SET pid=NULL WHERE id=?", array($jid));
+		$this->db->commit();
+		$this->log("Job {$jid} stopped");
 	}
 
 	/**
@@ -392,10 +643,11 @@ class WorkQueue {
 	 */
 	public function requeue_failed($jid) {
 		$this->db->beginTransaction();
-		$query = $this->db->prepare("UPDATE tasks SET pid=NULL, status=0 WHERE job_id=? AND status=?");
-		$query->execute(array($jid, self::STATUS_FAILED));
-		$this->log("Requeued {$query->rowCount()} tasks");
+		$this->db->execOne("UPDATE tasks SET pid=NULL, status=0 WHERE job_id=? AND status=?", array($jid, self::STATUS_FAILED));
+		#$query = $this->db->prepare("UPDATE tasks SET pid=NULL, status=0 WHERE job_id=? AND status=?");
+		#$query->execute(array($jid, self::STATUS_FAILED));
 		$this->db->commit();
+		$this->log("Requeued {$query->rowCount()} tasks");
 	}
 
 	/**
@@ -403,7 +655,8 @@ class WorkQueue {
 	 *
 	 * @param string $message
 	 */
-	private function log($message) {
+	public function log($message) {
+		if(!$this->debug) return;
 		fprintf(STDERR, "%6d %7.3f: %s\n", $this->pid, microtime(true)-$this->start_time, $message);
 	}
 
@@ -417,6 +670,7 @@ class WorkQueue {
 		if($argc != 4) WorkQueue::usage(STDERR);
 
 		$queue = WorkQueue::factory($argv[1]);
+		$queue->debug = true;
 		$job = $argv[2];
 
 		switch($argv[3]) {
@@ -429,6 +683,9 @@ class WorkQueue {
 				$queue->run_job($job, true);
 				break;
 			case 'worker':
+				WorkQueue::$instance = $queue;
+				WorkQueue::$job = $job;
+
 				$queue->log("------------------");
 				$queue->bootstrap($job);
 
@@ -477,6 +734,7 @@ class WorkQueue {
 		fputs($stream, "  cmd   : one of\n");
 		fputs($stream, "    process : run as job manager, spawning workers as required\n");
 		fputs($stream, "    daemon  : run as a daemon for a job (waits for tasks)\n");
+		fputs($stream, "    stop    : terminate manager and workers for job\n");
 		fputs($stream, "    worker  : run a single worker for a job\n");
 		fputs($stream, "    status  : print job status\n");
 		fputs($stream, "    requeue : requeue failed tasks for a job\n");
@@ -485,9 +743,15 @@ class WorkQueue {
 	}
 }
 
+class PDONotFoundException extends PDOException {}
+
 class NoMoreWork extends Exception {}
 
+class WorkQueueException extends Exception {}
+
+class WorkQueueTimeoutException extends WorkQueueException {}
+
 // make file executable
-if ( basename(__FILE__) == basename($_SERVER["SCRIPT_FILENAME"]) ) {
+if ( realpath(__FILE__) == realpath($_SERVER["SCRIPT_FILENAME"]) ) {
 	WorkQueue::main($argc, $argv);
 }
