@@ -1,0 +1,5 @@
+*.phar
+test.queue*
+.buildpath
+.project
+.settings
