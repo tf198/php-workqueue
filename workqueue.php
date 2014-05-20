@@ -231,8 +231,18 @@ class WorkQueue {
 		return $this->task_query($criteria, $params);
 	}
 
+	/**
+	 * Get a list of tasks.
+	 * Will block until all tasks have completed.
+	 *
+	 * @param array $task_ids
+	 * @param number $timeout
+	 * @return mixed
+	 */
 	public function get_task_set($task_ids, $timeout=300) {
-
+		$placeholders = array_fill(0, count($task_ids), '?');
+		$criteria = "id IN (" . implode(',', $placeholders) . ")";
+		return $this->task_query($criteria, $task_ids, $timeout);
 	}
 
 	public function task_query($criteria, $params, $timeout=300) {
@@ -265,11 +275,40 @@ class WorkQueue {
 	 * @param number $jid job id
 	 * @param number $priority limit to a specific priority queue
 	 * @param number $timeout seconds to block before raising WorkQueueTimeoutException
+	 * @param boolean $throw
 	 * @throws WorkQueueTimeoutException
 	 * @throws Exception if any of the tasks failed
+	 * @return array
 	 */
 	public function get_results($jid, $priority=false, $timeout=300, $throw=true) {
 		$tasks = $this->get_tasks($jid, $priority, $timeout);
+		return $this->task_results($tasks, $throw);
+	}
+
+	/**
+	 * Get a list of results for a set of task ids.
+	 * Will block until all results are ready
+	 *
+	 * @param array $task_ids
+	 * @param number $timeout
+	 * @param boolean $throw
+	 * @return array
+	 */
+	public function get_result_set($task_ids, $timeout=300, $throw=true) {
+		$tasks = $this->get_task_set($task_ids, $timeout);
+		return $this->task_results($tasks, $throw);
+	}
+
+	/**
+	 * Returns list of results for a set of tasks.  Will throw an exception
+	 * if any of the tasks failed.
+	 *
+	 * @param array $tasks list of tasks
+	 * @param boolean $throw
+	 * @throws unknown
+	 * @return multitype:unknown
+	 */
+	public function task_results($tasks, $throw=true) {
 		$result = array();
 		foreach($tasks as $task) {
 			if($throw && $task['status']==self::STATUS_FAILED) throw $task['result'];

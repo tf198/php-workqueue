@@ -70,8 +70,9 @@ class WorkQueueTest extends PHPUnit_Framework_TestCase {
 
 	/**
 	 * Run a multi stage calculation and check the results.
+	 * Should block until background processing finishes.
 	 */
-	function testWaitForResults() {
+	function testTaskResults() {
 		$job = $this->queue->add_job('tests/tasks.php', 2);
 		$this->queue->add_task($job, 'Test::add_two', array(3), 1);
 		$this->queue->add_task($job, 'Test::add_two', array(6), 1);
@@ -80,6 +81,17 @@ class WorkQueueTest extends PHPUnit_Framework_TestCase {
 		$this->queue->run_background($job);
 
 		$this->assertEquals($this->queue->get_result($task), 13);
+	}
+
+	function testTaskSetResults() {
+		$job = $this->queue->add_job('tests/tasks.php', 2);
+		$andy = $this->queue->add_task($job, 'Test::Hello', array('Andy'));
+		$bob = $this->queue->add_task($job, 'Test::Hello', array('Bob'));
+		$charlie = $this->queue->add_task($job, 'Test::Hello', array('Charlie'));
+
+		$this->queue->run_job($job);
+
+		$this->assertEquals($this->queue->get_result_set(array($andy, $charlie)), array('Hello Andy', 'Hello Charlie'));
 	}
 
 	/**

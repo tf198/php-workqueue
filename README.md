@@ -10,9 +10,12 @@ uploaded images etc) or to run tasks in parallel.
 Features
 ========
 
-* Command line interface for monitoring and manipulating task queues.
+* API for monitoring and manipulating jobs.
+* Command line interface for monitoring and manipulating jobs.
 * Job continuation in the event of power loss etc.
-* Custom parameters per job (number of workers, bootstrap file etc)
+* Custom parameters per job (number of workers, bootstrap file).
+* Full logging from workers.
+* Priority based task groups.
 
 Example
 =======
@@ -35,16 +38,29 @@ class Background {
 <?php
 import "workqueue.php";
 
+// multiple jobs can share the same queue
 $queue = WorkQueue::factory('test.queue');
-$job = $queue->add_job('tasks.php', 2); # 2 workers for the job
 
+/*
+Each job has a bootstrap file which will be loaded by the workers.
+It can either contain the tasks or be a generic AutoLoader.
+The job also has a maximum number of workers - in this case 2.
+*/
+$job = $queue->add_job('tasks.php', 2);
+
+// Create some tasks
 $queue->add_task($job, 'Background::say_hi', array('Bob'));
 $queue->add_task($job, 'Background::say_hi', array('Fred'));
 
-// Run the job in the current process, can also spawn a separate process if required
+/*
+Here we run the job in the current process - note this just starts the workers
+and makes sure they dont die.
+You can also run asynchronously with run_background($job)
+*/
 $queue->run_job($job);
 
+// Fetching results waits for all to complete.
 var_dump($queue->get_results($job));
-// array('Hello Bob', 'Hello Fred');
+// output: array('Hello Bob', 'Hello Fred');
 ?>
 ```
