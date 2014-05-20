@@ -130,7 +130,7 @@ class WorkQueueTest extends PHPUnit_Framework_TestCase {
 				$this->queue->add_task($job, 'Test::factors', array($target, $i, $i+$step));
 		}
 
-		$this->queue->debug = true;
+		#$this->queue->debug = true;
 		$this->queue->run_job($job);
 
 		$result = call_user_func_array('array_merge', $this->queue->get_results($job));

@@ -114,6 +114,7 @@ class WorkQueue {
 
 		$this->log_dir = $this->path . ".logs";
 
+		$this->db->beginTransaction();
 		$this->db->exec("PRAGMA busy_timeout=10000");
 
 		if($created) {
@@ -132,6 +133,7 @@ class WorkQueue {
 				mkdir($this->log_dir);
 			}
 		}
+		$this->db->commit();
 	}
 
 	/**
@@ -436,8 +438,8 @@ class WorkQueue {
 		// check there isn't another manager running
 		if($job['pid']) {
 			if($this->is_running($job['pid'])) {
-				$this->log("Process {$job['pid']} already managing this queue");
-				exit(1);
+				$this->log("Process {$job['pid']} already managing job {$jid}");
+				throw new WorkQueueException("Job {$jid} already processing");
 			}
 		}
 
